@@ -1,0 +1,6 @@
+
+weights/*
+!weights/placeholder
+
+env/*
+!env/placeholder

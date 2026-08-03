@@ -71,7 +71,7 @@ class FullModel(nn.Module):
 
 def get_model(config):
     if config.MODEL.NAME == 'detconfcmx':
-        from lib.models.cmx.builder_np_conf import EncoderDecoder as detconfcmx
+        from TruFor_train_test.lib.models.cmx.builder_np_conf import EncoderDecoder as detconfcmx
         return detconfcmx(cfg=config)
     else:
         raise NotImplementedError("Model not implemented")

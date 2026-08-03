@@ -1,8 +1,21 @@
+"""
+Edited in March 2026
+@author: xander.staelens
+"""
+
 import torch
 import torch.nn as nn
 
 from timm.models.layers import trunc_normal_
 import math
+
+# add project root to path
+import sys, os
+path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../../../../..')
+if path not in sys.path:
+    sys.path.insert(0, path)
+
+from maskedCNN import MaskedSequential, MaskedConv2d, MaskedAdaptiveAvgPool2d, MaskedAdaptiveMaxPool2d, copy_mask
 
 
 # Feature Rectify Module
@@ -10,19 +23,20 @@ class ChannelWeights(nn.Module):
     def __init__(self, dim, reduction=1):
         super(ChannelWeights, self).__init__()
         self.dim = dim
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.avg_pool = MaskedAdaptiveAvgPool2d(1)
+        self.max_pool = MaskedAdaptiveMaxPool2d(1)
         self.mlp = nn.Sequential(
                     nn.Linear(self.dim * 4, self.dim * 4 // reduction),
                     nn.ReLU(inplace=True),
                     nn.Linear(self.dim * 4 // reduction, self.dim * 2), 
                     nn.Sigmoid())
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, mask):
+        # x1, x2: B C H W
         B, _, H, W = x1.shape
-        x = torch.cat((x1, x2), dim=1)
-        avg = self.avg_pool(x).view(B, self.dim * 2)
-        max = self.max_pool(x).view(B, self.dim * 2)
+        x = torch.cat((x1, x2), dim=1) # B 2C H W
+        avg = self.avg_pool(x, mask).view(B, self.dim * 2) # B 2C
+        max = self.max_pool(x, mask).view(B, self.dim * 2) # B 2C
         y = torch.cat((avg, max), dim=1) # B 4C
         y = self.mlp(y).view(B, self.dim * 2, 1)
         channel_weights = y.reshape(B, 2, self.dim, 1, 1).permute(1, 0, 2, 3, 4) # 2 B C 1 1
@@ -33,16 +47,18 @@ class SpatialWeights(nn.Module):
     def __init__(self, dim, reduction=1):
         super(SpatialWeights, self).__init__()
         self.dim = dim
-        self.mlp = nn.Sequential(
-                    nn.Conv2d(self.dim * 2, self.dim // reduction, kernel_size=1),
+        self.mlp = MaskedSequential(
+                    MaskedConv2d(self.dim * 2, self.dim // reduction, kernel_size=1),
                     nn.ReLU(inplace=True),
-                    nn.Conv2d(self.dim // reduction, 2, kernel_size=1), 
+                    MaskedConv2d(self.dim // reduction, 2, kernel_size=1),
                     nn.Sigmoid())
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, mask):
+        # x1, x2: B C H W
         B, _, H, W = x1.shape
         x = torch.cat((x1, x2), dim=1) # B 2C H W
-        spatial_weights = self.mlp(x).reshape(B, 2, 1, H, W).permute(1, 0, 2, 3, 4) # 2 B 1 H W
+        spatial_weights, mask = self.mlp(x, mask)
+        spatial_weights = spatial_weights.reshape(B, 2, 1, H, W).permute(1, 0, 2, 3, 4) # 2 B 1 H W
         return spatial_weights
 
 
@@ -69,12 +85,13 @@ class FeatureRectifyModule(nn.Module):
             if m.bias is not None:
                 m.bias.data.zero_()
     
-    def forward(self, x1, x2):
-        channel_weights = self.channel_weights(x1, x2)
-        spatial_weights = self.spatial_weights(x1, x2)
-        out_x1 = x1 + self.lambda_c * channel_weights[1] * x2 + self.lambda_s * spatial_weights[1] * x2
-        out_x2 = x2 + self.lambda_c * channel_weights[0] * x1 + self.lambda_s * spatial_weights[0] * x1
-        return out_x1, out_x2 
+    def forward(self, x1, x2, mask):
+        # x1, x2: B C H W
+        channel_weights = self.channel_weights(x1, x2, mask)
+        spatial_weights = self.spatial_weights(x1, x2, mask)
+        out_x1 = x1 + self.lambda_c * channel_weights[1] * x2 + self.lambda_s * spatial_weights[1] * x2 # corresponding positions so no contamination
+        out_x2 = x2 + self.lambda_c * channel_weights[0] * x1 + self.lambda_s * spatial_weights[0] * x1 # corresponding positions so no contamination
+        return out_x1, out_x2 # did not modify mask in way that needs to be kept
 
 
 # Stage 1
@@ -91,12 +108,13 @@ class CrossAttention(nn.Module):
         self.kv2 = nn.Linear(dim, dim * 2, bias=qkv_bias)
 
     def forward(self, x1, x2):
+        # x1, x2: B N C/reduction
         B, N, C = x1.shape
-        q1 = x1.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
-        q2 = x2.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
+        q1 = x1.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous() # B H N C
+        q2 = x2.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous() # B H N C
         
-        k1, v1 = self.kv1(x1).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
-        k2, v2 = self.kv2(x2).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+        k1, v1 = self.kv1(x1).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()  # pure on channels (no contamination)
+        k2, v2 = self.kv2(x2).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()  # pure on channels (no contamination)
 
         # q,k,v  B H N C
         
@@ -105,8 +123,8 @@ class CrossAttention(nn.Module):
         ctx2 = (k2.transpose(-2, -1) @ v2) * self.scale  # B H C C
         ctx2 = ctx2.softmax(dim=-2)
 
-        x1 = (q1 @ ctx2).permute(0, 2, 1, 3).reshape(B, N, C).contiguous() 
-        x2 = (q2 @ ctx1).permute(0, 2, 1, 3).reshape(B, N, C).contiguous() 
+        x1 = (q1 @ ctx2).permute(0, 2, 1, 3).reshape(B, N, C).contiguous() # B N C/reduction
+        x2 = (q2 @ ctx1).permute(0, 2, 1, 3).reshape(B, N, C).contiguous() # B N C/reduction
 
         return x1, x2
 
@@ -125,14 +143,15 @@ class CrossPath(nn.Module):
         self.norm2 = norm_layer(dim)
 
     def forward(self, x1, x2):
-        y1, u1 = self.act1(self.channel_proj1(x1)).chunk(2, dim=-1)
-        y2, u2 = self.act2(self.channel_proj2(x2)).chunk(2, dim=-1)
-        v1, v2 = self.cross_attn(u1, u2)
-        y1 = torch.cat((y1, v1), dim=-1)
-        y2 = torch.cat((y2, v2), dim=-1)
-        out_x1 = self.norm1(x1 + self.end_proj1(y1))
-        out_x2 = self.norm2(x2 + self.end_proj2(y2))
-        return out_x1, out_x2
+        # x1, x2: B N C
+        y1, u1 = self.act1(self.channel_proj1(x1)).chunk(2, dim=-1) # 2 parts B N C//reduction
+        y2, u2 = self.act2(self.channel_proj2(x2)).chunk(2, dim=-1) # 2 parts B N C//reduction
+        v1, v2 = self.cross_attn(u1, u2) # 2 parts B N C//reduction
+        y1 = torch.cat((y1, v1), dim=-1) # B N C//reduction * 2
+        y2 = torch.cat((y2, v2), dim=-1) # B N C//reduction * 2
+        out_x1 = self.norm1(x1 + self.end_proj1(y1)) # B N C/reduction -> B N C
+        out_x2 = self.norm2(x2 + self.end_proj2(y2)) # B N C/reduction -> B N C
+        return out_x1, out_x2 # B N C
 
 
 # Stage 2
@@ -140,23 +159,27 @@ class ChannelEmbed(nn.Module):
     def __init__(self, in_channels, out_channels, reduction=1, norm_layer=nn.BatchNorm2d):
         super(ChannelEmbed, self).__init__()
         self.out_channels = out_channels
-        self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.channel_embed = nn.Sequential(
-                        nn.Conv2d(in_channels, out_channels//reduction, kernel_size=1, bias=True),
-                        nn.Conv2d(out_channels//reduction, out_channels//reduction, kernel_size=3, stride=1, padding=1, bias=True, groups=out_channels//reduction),
+        self.residual = MaskedConv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.channel_embed = MaskedSequential(
+                        MaskedConv2d(in_channels, out_channels//reduction, kernel_size=1, bias=True),
+                        MaskedConv2d(out_channels//reduction, out_channels//reduction, kernel_size=3, stride=1, padding=1, bias=True, groups=out_channels//reduction),
                         nn.ReLU(inplace=True),
-                        nn.Conv2d(out_channels//reduction, out_channels, kernel_size=1, bias=True),
+                        MaskedConv2d(out_channels//reduction, out_channels, kernel_size=1, bias=True),
                         norm_layer(out_channels) 
                         )
         self.norm = norm_layer(out_channels)
         
-    def forward(self, x, H, W):
+    def forward(self, x, mask, H, W):
+        # x: B N C*2
         B, N, _C = x.shape
-        x = x.permute(0, 2, 1).reshape(B, _C, H, W).contiguous()
-        residual = self.residual(x)
-        x = self.channel_embed(x)
+
+        _mask = copy_mask(mask)
+
+        x = x.permute(0, 2, 1).reshape(B, _C, H, W).contiguous() # B C*2 H W
+        residual, _mask = self.residual(x, _mask)
+        x, mask = self.channel_embed(x, _mask)
         out = self.norm(residual + x)
-        return out
+        return out, mask
 
 
 class FeatureFusionModule(nn.Module):
@@ -181,13 +204,16 @@ class FeatureFusionModule(nn.Module):
             if m.bias is not None:
                 m.bias.data.zero_()
 
-    def forward(self, x1, x2):
+    def forward(self, x1, x2, mask):
+        # x1, x2: B C H W
         B, C, H, W = x1.shape
-        x1 = x1.flatten(2).transpose(1, 2)
-        x2 = x2.flatten(2).transpose(1, 2)
-        x1, x2 = self.cross(x1, x2) 
-        merge = torch.cat((x1, x2), dim=-1)
-        merge = self.channel_emb(merge, H, W)
+
+        _mask = copy_mask(mask)
+        x1 = x1.flatten(2).transpose(1, 2) # B N C
+        x2 = x2.flatten(2).transpose(1, 2) # B N C
+        x1, x2 = self.cross(x1, x2) # B N C
+        merge = torch.cat((x1, x2), dim=-1) # B N C*2
+        merge, _mask = self.channel_emb(merge, _mask, H, W)
         
-        return merge
+        return merge, _mask
     

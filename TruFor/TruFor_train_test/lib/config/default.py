@@ -108,7 +108,7 @@ _C.TEST.MODEL_FILE = ''
 def update_config(cfg, args):
     cfg.defrost()
 
-    cfg.merge_from_file(f'lib/config/{args.experiment}.yaml')
+    cfg.merge_from_file(f'TruFor_train_test/lib/config/{args.experiment}.yaml')
     if cfg.TEST.MODEL_FILE == '':
         cfg.merge_from_list(['TEST.MODEL_FILE', f'weights/{args.experiment}/best.pth.tar'])
     try:

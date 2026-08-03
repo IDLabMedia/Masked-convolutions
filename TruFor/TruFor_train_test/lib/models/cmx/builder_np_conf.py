@@ -12,6 +12,9 @@
 """
 Edited in September 2022
 @author: fabrizio.guillaro, davide.cozzolino
+
+Edited in March 2026
+@author: xander.staelens
 """
 
 import torch
@@ -19,9 +22,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 
-from lib.models.cmx.init_func import init_weight
+from TruFor_train_test.lib.models.cmx.init_func import init_weight
 
 import logging
+
+# add project root to path
+import sys
+path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../../../..')
+if path not in sys.path:
+    sys.path.insert(0, path)
+
+from maskedCNN import create_mask
+
 
 
 def preprc_imagenet_torch(x):
@@ -133,7 +145,7 @@ class EncoderDecoder(nn.Module):
             raise NotImplementedError('Decoder not implemented')
 
         # Noiseprint++ extractor
-        from lib.models.DnCNN import make_net
+        from TruFor_train_test.lib.models.DnCNN import make_net
         num_levels = 17
         out_channel = self.np_out_ch
         self.dncnn = make_net(3, kernels=[3, ] * num_levels,
@@ -205,7 +217,14 @@ class EncoderDecoder(nn.Module):
 
 
 
-    def encode_decode(self, rgb, modal_x):
+    def encode_decode(self, rgb, modal_x, distraction_cover=None):
+
+        ## RGB -> Bx3xHxW
+        ## Noisprint -> Bx1xHxW -> Bx3xHxW (after tiling)
+        ## Distraction mask -> Bx1xHxW
+
+        # get mask from distraction cover
+        mask = create_mask(distraction_cover, x=rgb)
 
         if rgb is not None:
             orisize = rgb.shape
@@ -216,52 +235,55 @@ class EncoderDecoder(nn.Module):
         if 'backbone' in self.cfg.FIX_MODULES:
             with torch.no_grad():
                 self.backbone.eval()
-                x = self.backbone(rgb, modal_x)
+                x, masks = self.backbone(rgb, modal_x, mask)
         else:            
-            x = self.backbone(rgb, modal_x)
+            x, masks = self.backbone(rgb, modal_x, mask)
 
 
         # anomaly localization
         if 'loc_head' in self.cfg.FIX_MODULES:
             with torch.no_grad():
                 self.decode_head.eval()
-                out = self.decode_head(x)
+                out, mask = self.decode_head(x, masks)
         else:
-            out = self.decode_head(x)
+            out, mask = self.decode_head(x, masks)
 
         out = F.interpolate(out, size=orisize[2:], mode='bilinear', align_corners=False)
 
 
-        # confidence estimation
-        if self.decode_head_conf:
-            if 'conf_head' in self.cfg.FIX_MODULES:
-                with torch.no_grad():
-                    self.decode_head_conf.eval()
-                    conf = self.decode_head_conf(x)
-            else:
-                conf = self.decode_head_conf(x)
-            conf = F.interpolate(conf, size=orisize[2:], mode='bilinear', align_corners=False)
-        else: 
-            conf = None
+        ## Confidence Estimation not addapted yet
+        conf = None
+        # # confidence estimation
+        # if self.decode_head_conf:
+        #     if 'conf_head' in self.cfg.FIX_MODULES:
+        #         with torch.no_grad():
+        #             self.decode_head_conf.eval()
+        #             conf = self.decode_head_conf(x)
+        #     else:
+        #         conf = self.decode_head_conf(x)
+        #     conf = F.interpolate(conf, size=orisize[2:], mode='bilinear', align_corners=False)
+        # else: 
+        #     conf = None
 
-        
-        # detection
-        if self.detection:
-            if self.conf_detection == 'confpool':
-                from .layer_utils import weighted_statistics_pooling
-                f1 = weighted_statistics_pooling(conf).view(out.shape[0],-1)
-                f2 = weighted_statistics_pooling(out[:,1:2,:,:]-out[:,0:1,:,:], F.logsigmoid(conf)).view(out.shape[0],-1)
-                det = self.detection(torch.cat((f1,f2),-1))
-            else:
-                assert False
-        else:
-            det = None
+        ## Detection not addapted yet
+        det = None
+        # # detection
+        # if self.detection:
+        #     if self.conf_detection == 'confpool':
+        #         from .layer_utils import weighted_statistics_pooling
+        #         f1 = weighted_statistics_pooling(conf).view(out.shape[0],-1)
+        #         f2 = weighted_statistics_pooling(out[:,1:2,:,:]-out[:,0:1,:,:], F.logsigmoid(conf)).view(out.shape[0],-1)
+        #         det = self.detection(torch.cat((f1,f2),-1))
+        #     else:
+        #         assert False
+        # else:
+        #     det = None
         
         return out, conf, det
 
 
 
-    def forward(self, rgb, save_np=False):
+    def forward(self, rgb, save_np=False, distraction_cover=None):
         # rgb should be a float tensor in the range [0,1], since Noiseprint++ has been trained with this input
 
         # Noiseprint++ extraction
@@ -288,7 +310,7 @@ class EncoderDecoder(nn.Module):
             rgb = self.prepro(rgb)
 
         # Localization and Detection
-        out, conf, det = self.encode_decode(rgb, modal_x)
+        out, conf, det = self.encode_decode(rgb, modal_x, distraction_cover=distraction_cover)
 
         if save_np:
             return out, conf, det, modal_x

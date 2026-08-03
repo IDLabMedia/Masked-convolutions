@@ -1,3 +1,8 @@
+"""
+Edited in March 2026
+@author: xander.staelens
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +18,15 @@ import logging as logger
 
 #logger = get_logger()
 
+# add project root to path
+import sys, os
+path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../../../../..')
+if path not in sys.path:
+    sys.path.insert(0, path)
+
+from maskedCNN import MaskedConv2d, copy_mask
+    
+
 
 class DWConv(nn.Module):
     """
@@ -20,15 +34,15 @@ class DWConv(nn.Module):
     """
     def __init__(self, dim=768):
         super(DWConv, self).__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=3, stride=1, padding=1, bias=True, groups=dim)
+        self.dwconv = MaskedConv2d(dim, dim, kernel_size=3, stride=1, padding=1, bias=True, groups=dim)
 
-    def forward(self, x, H, W):
+    def forward(self, x, mask, H, W):
         B, N, C = x.shape
         x = x.permute(0, 2, 1).reshape(B, C, H, W).contiguous() # B N C -> B C N -> B C H W
-        x = self.dwconv(x) 
+        x, mask = self.dwconv(x, mask) 
         x = x.flatten(2).transpose(1, 2) # B C H W -> B N C
 
-        return x
+        return x, mask
 
 
 class Mlp(nn.Module):
@@ -62,14 +76,14 @@ class Mlp(nn.Module):
             if m.bias is not None:
                 m.bias.data.zero_()
 
-    def forward(self, x, H, W):
-        x = self.fc1(x)
-        x = self.dwconv(x, H, W)
+    def forward(self, x, mask, H, W):
+        x = self.fc1(x) # B N C -> B N hidden_features
+        x, mask = self.dwconv(x, mask, H, W) # B N hidden_features -> B N hidden_features
         x = self.act(x)
         x = self.drop(x)
-        x = self.fc2(x)
+        x = self.fc2(x) # B N hidden_features -> B N C
         x = self.drop(x)
-        return x
+        return x, mask
 
 
 class Attention(nn.Module):
@@ -83,15 +97,15 @@ class Attention(nn.Module):
         self.scale = qk_scale or head_dim ** -0.5
 
         # Linear embedding
-        self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.q = nn.Linear(dim, dim, bias=qkv_bias) # pure on channels (no contamination)
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias) # pure on channels (no contamination)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = nn.Linear(dim, dim) # pure on channels (no contamination)
         self.proj_drop = nn.Dropout(proj_drop)
 
         self.sr_ratio = sr_ratio
         if sr_ratio > 1:
-            self.sr = nn.Conv2d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio)
+            self.sr = MaskedConv2d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio)
             self.norm = nn.LayerNorm(dim)
 
         self.apply(self._init_weights)
@@ -111,29 +125,32 @@ class Attention(nn.Module):
             if m.bias is not None:
                 m.bias.data.zero_()
 
-    def forward(self, x, H, W):
+    def forward(self, x, mask, H, W):
         B, N, C = x.shape
         # B N C -> B N num_head C//num_head -> B C//num_head N num_heads
-        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3) 
+        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)  # pure on channels (no contamination)
 
         if self.sr_ratio > 1:
-            x_ = x.permute(0, 2, 1).reshape(B, C, H, W) 
-            x_ = self.sr(x_).reshape(B, C, -1).permute(0, 2, 1) 
+            x_ = x.permute(0, 2, 1).reshape(B, C, H, W) # B N C -> B C N -> B C H W
+            x_, mask = self.sr(x_, mask)
+            x_ = x_.reshape(B, C, -1).permute(0, 2, 1) # B C H' W' -> B N' C
             x_ = self.norm(x_)
-            kv = self.kv(x_).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4) 
+            kv = self.kv(x_).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4) # pure on channels (no contamination)
         else:
-            kv = self.kv(x).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4) 
-        k, v = kv[0], kv[1]
+            kv = self.kv(x).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4) # pure on channels (no contamination)
+        
+        k, v = kv[0], kv[1] # B num_head N C//num_head
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C) # B N num_head C//num_head -> B N C
 
-        return x
+        x = self.proj(x) # pure on channels (no contamination)
+        x = self.proj_drop(x) # B N C
+
+        return x, mask
 
 
 class Block(nn.Module):
@@ -171,11 +188,14 @@ class Block(nn.Module):
             if m.bias is not None:
                 m.bias.data.zero_()
 
-    def forward(self, x, H, W):
-        x = x + self.drop_path(self.attn(self.norm1(x), H, W))
-        x = x + self.drop_path(self.mlp(self.norm2(x), H, W))
+    def forward(self, x, mask, H, W):
+        _mask = copy_mask(mask)
+        x_, _mask = self.attn(self.norm1(x), _mask, H, W)  # B N C
+        x = x + self.drop_path(x_)
+        x_, mask = self.mlp(self.norm2(x), mask, H, W)  # B N C
+        x = x + self.drop_path(x_)
 
-        return x
+        return x, mask  # B N C
 
 
 class OverlapPatchEmbed(nn.Module):
@@ -191,7 +211,7 @@ class OverlapPatchEmbed(nn.Module):
         self.patch_size = patch_size
         self.H, self.W = img_size[0] // patch_size[0], img_size[1] // patch_size[1]
         self.num_patches = self.H * self.W
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=stride,
+        self.proj = MaskedConv2d(in_chans, embed_dim, kernel_size=patch_size, stride=stride,
                               padding=(patch_size[0] // 2, patch_size[1] // 2))
         self.norm = nn.LayerNorm(embed_dim)
 
@@ -212,15 +232,16 @@ class OverlapPatchEmbed(nn.Module):
             if m.bias is not None:
                 m.bias.data.zero_()
 
-    def forward(self, x):
+    def forward(self, x, mask):
         # B C H W
-        x = self.proj(x)
+        x, mask = self.proj(x, mask)
+        # x = self.proj(x)
         _, _, H, W = x.shape
         x = x.flatten(2).transpose(1, 2)
         # B H*W/16 C
         x = self.norm(x)
 
-        return x, H, W
+        return x, mask, H, W
 
 
 class RGBXTransformer(nn.Module):
@@ -229,6 +250,25 @@ class RGBXTransformer(nn.Module):
                  attn_drop_rate=0., drop_path_rate=0., norm_layer=nn.LayerNorm, norm_fuse=nn.BatchNorm2d,
                  depths=[3, 4, 6, 3], sr_ratios=[8, 4, 2, 1], stride0=4):
         super().__init__()
+
+
+        """" mit_b2
+            mit_b2(fuse_cfg=None, stride0=4, **kwargs):
+
+            patch_size=4, 
+            embed_dims=[64, 128, 320, 512], 
+            num_heads=[1, 2, 5, 8], 
+            mlp_ratios=[4, 4, 4, 4],
+            qkv_bias=True, 
+            norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+            depths=[3, 4, 6, 3], 
+            sr_ratios=[8, 4, 2, 1],
+            drop_rate=0.0, 
+            drop_path_rate=0.1, 
+            stride0=stride0
+        
+        """
+
         self.num_classes = num_classes
         self.depths = depths
 
@@ -367,87 +407,89 @@ class RGBXTransformer(nn.Module):
         else:
             raise TypeError('pretrained must be a str or None')
         
-    def forward_features(self, x_rgb, x_e):
+    def forward_features(self, x_rgb, x_e, mask):
         """
         x_rgb: B x N x H x W
         """
         B = x_rgb.shape[0]
         outs = []
+        masks_out = []
         outs_fused = []
+        mask_e = copy_mask(mask)
 
         # stage 1
-        x_rgb, H, W = self.patch_embed1(x_rgb)
-        # B H*W/16 C
-        x_e, _, _ = self.extra_patch_embed1(x_e)
+        x_rgb, mask, H, W = self.patch_embed1(x_rgb, mask) # -> B H*W/16 C
+        x_e, mask_e, _, _ = self.extra_patch_embed1(x_e, mask_e) # same H and W
         for i, blk in enumerate(self.block1):
-            x_rgb = blk(x_rgb, H, W)
+            x_rgb, mask = blk(x_rgb, mask, H, W)  # B N C
         for i, blk in enumerate(self.extra_block1):
-            x_e = blk(x_e, H, W)
+            x_e, mask_e = blk(x_e, mask_e, H, W)  # B N C
         x_rgb = self.norm1(x_rgb)
         x_e = self.extra_norm1(x_e)
 
-        x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
-        x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
-        x_rgb, x_e = self.FRMs[0](x_rgb, x_e)
-        x_fused = self.FFMs[0](x_rgb, x_e)
+        x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous() # B N C -> B C H W
+        x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous() # B N C -> B C H W
+        x_rgb, x_e = self.FRMs[0](x_rgb, x_e, mask)
+        x_fused, _mask = self.FFMs[0](x_rgb, x_e, mask)
         outs.append(x_fused)
+        masks_out.append(_mask)
         
-
         # stage 2
-        x_rgb, H, W = self.patch_embed2(x_rgb)
-        x_e, _, _ = self.extra_patch_embed2(x_e)
+        x_rgb, mask, H, W = self.patch_embed2(x_rgb, mask)
+        x_e, mask_e, _, _ = self.extra_patch_embed2(x_e, mask_e)
         for i, blk in enumerate(self.block2):
-            x_rgb = blk(x_rgb, H, W)
+            x_rgb, mask = blk(x_rgb, mask, H, W)
         for i, blk in enumerate(self.extra_block2):
-            x_e = blk(x_e, H, W)
+            x_e, mask_e = blk(x_e, mask_e, H, W)
         x_rgb = self.norm2(x_rgb)
         x_e = self.extra_norm2(x_e)
 
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
-        x_rgb, x_e = self.FRMs[1](x_rgb, x_e)
-        x_fused = self.FFMs[1](x_rgb, x_e)
+        x_rgb, x_e = self.FRMs[1](x_rgb, x_e, mask)
+        x_fused, _mask = self.FFMs[1](x_rgb, x_e, mask)
         outs.append(x_fused)
+        masks_out.append(_mask)
         
-
         # stage 3
-        x_rgb, H, W = self.patch_embed3(x_rgb)
-        x_e, _, _ = self.extra_patch_embed3(x_e)
+        x_rgb, mask, H, W = self.patch_embed3(x_rgb, mask)
+        x_e, mask_e, _, _ = self.extra_patch_embed3(x_e, mask_e)
         for i, blk in enumerate(self.block3):
-            x_rgb = blk(x_rgb, H, W)
+            x_rgb, mask = blk(x_rgb, mask, H, W)
         for i, blk in enumerate(self.extra_block3):
-            x_e = blk(x_e, H, W)
+            x_e, mask_e = blk(x_e, mask_e, H, W)
         x_rgb = self.norm3(x_rgb)
         x_e = self.extra_norm3(x_e)
 
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
-        x_rgb, x_e = self.FRMs[2](x_rgb, x_e)
-        x_fused = self.FFMs[2](x_rgb, x_e)
+        x_rgb, x_e = self.FRMs[2](x_rgb, x_e, mask)
+        x_fused, _mask = self.FFMs[2](x_rgb, x_e, mask)
         outs.append(x_fused)
-        
+        masks_out.append(_mask)
 
         # stage 4
-        x_rgb, H, W = self.patch_embed4(x_rgb)
-        x_e, _, _ = self.extra_patch_embed4(x_e)
+        x_rgb, mask, H, W = self.patch_embed4(x_rgb, mask)
+        x_e, mask_e, _, _ = self.extra_patch_embed4(x_e, mask_e)
         for i, blk in enumerate(self.block4):
-            x_rgb = blk(x_rgb, H, W)
+            x_rgb, mask = blk(x_rgb, mask, H, W)
         for i, blk in enumerate(self.extra_block4):
-            x_e = blk(x_e, H, W)
+            x_e, mask_e = blk(x_e, mask_e, H, W)
         x_rgb = self.norm4(x_rgb)
         x_e = self.extra_norm4(x_e)
 
         x_rgb = x_rgb.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
         x_e = x_e.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous()
-        x_rgb, x_e = self.FRMs[3](x_rgb, x_e)
-        x_fused = self.FFMs[3](x_rgb, x_e)
+        x_rgb, x_e = self.FRMs[3](x_rgb, x_e, mask)
+        x_fused, _mask = self.FFMs[3](x_rgb, x_e, mask)
         outs.append(x_fused)
-        
-        return outs
+        masks_out.append(_mask)
 
-    def forward(self, x_rgb, x_e):
-        out = self.forward_features(x_rgb, x_e)
-        return out
+        return outs, masks_out
+
+    def forward(self, x_rgb, x_e, mask):
+        out, masks = self.forward_features(x_rgb, x_e, mask)
+        return out, masks
 
 
 def load_dualpath_model(model, model_file):

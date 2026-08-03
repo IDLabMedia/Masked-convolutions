@@ -12,6 +12,9 @@
 """
 Created in September 2022
 @author: fabrizio.guillaro
+
+Edited in September 2025
+@author: xander.staelens
 """
 
 from torch.utils.data import Dataset
@@ -22,8 +25,9 @@ from PIL import Image
 
 
 class TestDataset(Dataset):
-    def __init__(self, list_img=None):
+    def __init__(self, list_img=None, dic_cover=None):
         self.img_list = list_img
+        self.cover_dic = dic_cover
 
     def shuffle(self):
         random.shuffle(self.img_list)
@@ -36,7 +40,16 @@ class TestDataset(Dataset):
         assert 0 <= index < len(self.img_list), f"Index {index} is not available!"
         rgb_path = self.img_list[index]
         img_RGB = np.array(Image.open(rgb_path).convert("RGB"))
-        return torch.tensor(img_RGB.transpose(2, 0, 1), dtype=torch.float) / 256.0, rgb_path
+        if self.cover_dic and rgb_path in self.cover_dic and self.cover_dic[rgb_path] is not None:
+            cover_path = self.cover_dic[rgb_path]
+            cover_L = np.array(Image.open(cover_path).convert("L"))
+        else:
+            cover_L = np.zeros(img_RGB.shape[:2], dtype=np.uint8)
+        return (
+            torch.tensor(img_RGB.transpose(2, 0, 1), dtype=torch.float) / 256.0, 
+            torch.tensor(cover_L, dtype=torch.float).unsqueeze(0) / 255.0,
+            rgb_path
+        )
 
     def get_filename(self, index):
         item = self.img_list[index]

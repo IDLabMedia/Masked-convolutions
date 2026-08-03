@@ -7,7 +7,11 @@
 Modified by Myung-Joon Kwon
 mjkwon2021@gmail.com
 Aug 22, 2020
+
+Edited in March 2026
+@author: xander.staelens
 """
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -23,6 +27,15 @@ import torch.nn as nn
 import torch._utils
 import torch.nn.functional as F
 
+# add project root to path
+import sys
+path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '../../..')
+if path not in sys.path:
+    sys.path.insert(0, path)
+
+from maskedCNN import create_mask, MaskedSequential, MaskedConv2d, MaskedAdaptiveAvgPool2d, MaskedAdaptiveMaxPool2d, copy_mask
+
+
 BatchNorm2d = nn.BatchNorm2d
 BN_MOMENTUM = 0.01
 logger = logging.getLogger(__name__)
@@ -33,50 +46,56 @@ def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
                      padding=1, bias=False)
 
+def maskedConv3x3(in_planes, out_planes, stride=1):
+    """3x3 convolution with padding"""
+    return MaskedConv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, bias=False)
 
-class BasicBlock(nn.Module):
+
+class MaskedBasicBlock(nn.Module):
     expansion = 1
 
     def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(BasicBlock, self).__init__()
-        self.conv1 = conv3x3(inplanes, planes, stride)
+        super(MaskedBasicBlock, self).__init__()
+        self.conv1 = maskedConv3x3(inplanes, planes, stride)
         self.bn1 = BatchNorm2d(planes, momentum=BN_MOMENTUM)
         self.relu = nn.ReLU(inplace=True)
-        self.conv2 = conv3x3(planes, planes)
+        self.conv2 = maskedConv3x3(planes, planes)
         self.bn2 = BatchNorm2d(planes, momentum=BN_MOMENTUM)
         self.downsample = downsample
         self.stride = stride
 
-    def forward(self, x):
+    def forward(self, x, mask):
         residual = x
 
-        out = self.conv1(x)
+        out, mask = self.conv1(x, mask)
         out = self.bn1(out)
         out = self.relu(out)
 
-        out = self.conv2(out)
+        out, mask = self.conv2(out, mask)
         out = self.bn2(out)
 
         if self.downsample is not None:
-            residual = self.downsample(x)
+            mask_ = copy_mask(mask)
+            residual, mask_ = self.downsample(x, mask_)
 
         out += residual
         out = self.relu(out)
 
-        return out
+        return out, mask
 
 
-class Bottleneck(nn.Module):
+class MaskedBottleneck(nn.Module):
     expansion = 4
 
     def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
+        super(MaskedBottleneck, self).__init__()
+        self.conv1 = MaskedConv2d(inplanes, planes, kernel_size=1, bias=False)
         self.bn1 = BatchNorm2d(planes, momentum=BN_MOMENTUM)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+        self.conv2 = MaskedConv2d(planes, planes, kernel_size=3, stride=stride,
                                padding=1, bias=False)
         self.bn2 = BatchNorm2d(planes, momentum=BN_MOMENTUM)
-        self.conv3 = nn.Conv2d(planes, planes * self.expansion, kernel_size=1,
+        self.conv3 = MaskedConv2d(planes, planes * self.expansion, kernel_size=1,
                                bias=False)
         self.bn3 = BatchNorm2d(planes * self.expansion,
                                momentum=BN_MOMENTUM)
@@ -84,33 +103,34 @@ class Bottleneck(nn.Module):
         self.downsample = downsample
         self.stride = stride
 
-    def forward(self, x):
+    def forward(self, x, mask):
         residual = x
 
-        out = self.conv1(x)
+        out, mask = self.conv1(x, mask)
         out = self.bn1(out)
         out = self.relu(out)
 
-        out = self.conv2(out)
+        out, mask = self.conv2(out, mask)
         out = self.bn2(out)
         out = self.relu(out)
 
-        out = self.conv3(out)
+        out, mask = self.conv3(out, mask)
         out = self.bn3(out)
 
         if self.downsample is not None:
-            residual = self.downsample(x)
+            mask_ = copy_mask(mask)
+            residual, mask_ = self.downsample(x, mask_)
 
         out += residual
         out = self.relu(out)
 
-        return out
+        return out, mask
 
 
-class HighResolutionModule(nn.Module):
+class MaskedHighResolutionModule(nn.Module):
     def __init__(self, num_branches, blocks, num_blocks, num_inchannels,
                  num_channels, fuse_method, multi_scale_output=True):
-        super(HighResolutionModule, self).__init__()
+        super(MaskedHighResolutionModule, self).__init__()
         self._check_branches(
             num_branches, blocks, num_blocks, num_inchannels, num_channels)
 
@@ -150,8 +170,8 @@ class HighResolutionModule(nn.Module):
         downsample = None
         if stride != 1 or \
                 self.num_inchannels[branch_index] != num_channels[branch_index] * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.num_inchannels[branch_index],
+            downsample = MaskedSequential(
+                MaskedConv2d(self.num_inchannels[branch_index],
                           num_channels[branch_index] * block.expansion,
                           kernel_size=1, stride=stride, bias=False),
                 BatchNorm2d(num_channels[branch_index] * block.expansion,
@@ -167,7 +187,7 @@ class HighResolutionModule(nn.Module):
             layers.append(block(self.num_inchannels[branch_index],
                                 num_channels[branch_index]))
 
-        return nn.Sequential(*layers)
+        return MaskedSequential(*layers)
 
     def _make_branches(self, num_branches, block, num_blocks, num_channels):
         branches = []
@@ -189,8 +209,8 @@ class HighResolutionModule(nn.Module):
             fuse_layer = []
             for j in range(num_branches):
                 if j > i:
-                    fuse_layer.append(nn.Sequential(
-                        nn.Conv2d(num_inchannels[j],
+                    fuse_layer.append(MaskedSequential(
+                        MaskedConv2d(num_inchannels[j],
                                   num_inchannels[i],
                                   1,
                                   1,
@@ -204,22 +224,22 @@ class HighResolutionModule(nn.Module):
                     for k in range(i - j):
                         if k == i - j - 1:
                             num_outchannels_conv3x3 = num_inchannels[i]
-                            conv3x3s.append(nn.Sequential(
-                                nn.Conv2d(num_inchannels[j],
+                            conv3x3s.append(MaskedSequential(
+                                MaskedConv2d(num_inchannels[j],
                                           num_outchannels_conv3x3,
                                           3, 2, 1, bias=False),
                                 BatchNorm2d(num_outchannels_conv3x3,
                                             momentum=BN_MOMENTUM)))
                         else:
                             num_outchannels_conv3x3 = num_inchannels[j]
-                            conv3x3s.append(nn.Sequential(
-                                nn.Conv2d(num_inchannels[j],
+                            conv3x3s.append(MaskedSequential(
+                                MaskedConv2d(num_inchannels[j],
                                           num_outchannels_conv3x3,
                                           3, 2, 1, bias=False),
                                 BatchNorm2d(num_outchannels_conv3x3,
                                             momentum=BN_MOMENTUM),
                                 nn.ReLU(inplace=True)))
-                    fuse_layer.append(nn.Sequential(*conv3x3s))
+                    fuse_layer.append(MaskedSequential(*conv3x3s))
             fuse_layers.append(nn.ModuleList(fuse_layer))
 
         return nn.ModuleList(fuse_layers)
@@ -227,36 +247,47 @@ class HighResolutionModule(nn.Module):
     def get_num_inchannels(self):
         return self.num_inchannels
 
-    def forward(self, x):
+    def forward(self, x, mask_list): # is a list of inputs
         if self.num_branches == 1:
-            return [self.branches[0](x[0])]
+            x, mask = self.branches[0](x[0], mask_list[0])
+            return [x], [mask]
 
         for i in range(self.num_branches):
-            x[i] = self.branches[i](x[i])
+            x[i], mask_list[i] = self.branches[i](x[i], mask_list[i])
 
         x_fuse = []
+        mask_fuse = []
         for i in range(len(self.fuse_layers)):
-            y = x[0] if i == 0 else self.fuse_layers[i][0](x[0])
+            y_mask = mask_list[0]
+            # y = x[0] if i == 0 else self.fuse_layers[i][0](x[0], mask_list[0])
+            if i == 0:
+                y = x[0]
+            else:
+                y, y_mask = self.fuse_layers[i][0](x[0], y_mask)
+
             for j in range(1, self.num_branches):
                 if i == j:
                     y = y + x[j]
                 elif j > i:
                     width_output = x[i].shape[-1]
                     height_output = x[i].shape[-2]
+                    _x, _mask = self.fuse_layers[i][j](x[j], mask_list[j])
                     y = y + F.interpolate(
-                        self.fuse_layers[i][j](x[j]),
+                        _x,
                         size=[height_output, width_output],
                         mode='bilinear')
                 else:
-                    y = y + self.fuse_layers[i][j](x[j])
+                    _x, _mask = self.fuse_layers[i][j](x[j], mask_list[j])
+                    y = y + _x
             x_fuse.append(self.relu(y))
+            mask_fuse.append(y_mask)
 
-        return x_fuse
+        return x_fuse, mask_fuse
 
 
 blocks_dict = {
-    'BASIC': BasicBlock,
-    'BOTTLENECK': Bottleneck
+    'BASIC': MaskedBasicBlock,
+    'BOTTLENECK': MaskedBottleneck
 }
 
 
@@ -266,10 +297,10 @@ class CAT_Net(nn.Module):
         super(CAT_Net, self).__init__()
 
         # RGB branch
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1,
+        self.conv1 = MaskedConv2d(3, 64, kernel_size=3, stride=2, padding=1,
                                bias=False)
         self.bn1 = BatchNorm2d(64, momentum=BN_MOMENTUM)
-        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1,
+        self.conv2 = MaskedConv2d(64, 64, kernel_size=3, stride=2, padding=1,
                                bias=False)
         self.bn2 = BatchNorm2d(64, momentum=BN_MOMENTUM)
         self.relu = nn.ReLU(inplace=True)
@@ -312,8 +343,8 @@ class CAT_Net(nn.Module):
             self.stage4_cfg, num_channels, multi_scale_output=True)
 
         # DCT coefficient branch
-        self.dc_layer0_dil = nn.Sequential(
-            nn.Conv2d(in_channels=21,
+        self.dc_layer0_dil = MaskedSequential(
+            MaskedConv2d(in_channels=21,
                       out_channels=64,
                       kernel_size=3,
                       stride=1,
@@ -322,12 +353,12 @@ class CAT_Net(nn.Module):
             nn.BatchNorm2d(64, momentum=BN_MOMENTUM),
             nn.ReLU(inplace=True)
         )
-        self.dc_layer1_tail = nn.Sequential(
-            nn.Conv2d(in_channels=64, out_channels=4, kernel_size=1, stride=1, padding=0, bias=False),
+        self.dc_layer1_tail = MaskedSequential(
+            MaskedConv2d(in_channels=64, out_channels=4, kernel_size=1, stride=1, padding=0, bias=False),
             nn.BatchNorm2d(4, momentum=BN_MOMENTUM),
             nn.ReLU(inplace=True)
         )
-        self.dc_layer2 = self._make_layer(BasicBlock, inplanes=4 * 64 * 2, planes=96, blocks=4, stride=1)
+        self.dc_layer2 = self._make_layer(MaskedBasicBlock, inplanes=4 * 64 * 2, planes=96, blocks=4, stride=1)
 
         self.dc_stage3_cfg = extra['DC_STAGE3']
         num_channels = self.dc_stage3_cfg['NUM_CHANNELS']
@@ -363,8 +394,8 @@ class CAT_Net(nn.Module):
             self.stage5_cfg, num_channels)
 
         last_inp_channels = sum(pre_stage_channels)
-        self.last_layer = nn.Sequential(
-            nn.Conv2d(
+        self.last_layer = MaskedSequential(
+            MaskedConv2d(
                 in_channels=last_inp_channels,
                 out_channels=last_inp_channels,
                 kernel_size=1,
@@ -372,7 +403,7 @@ class CAT_Net(nn.Module):
                 padding=0),
             BatchNorm2d(last_inp_channels, momentum=BN_MOMENTUM),
             nn.ReLU(inplace=True),
-            nn.Conv2d(
+            MaskedConv2d(
                 in_channels=last_inp_channels,
                 out_channels=config.DATASET.NUM_CLASSES,
                 kernel_size=extra.FINAL_CONV_KERNEL,
@@ -389,8 +420,8 @@ class CAT_Net(nn.Module):
         for i in range(num_branches_cur):
             if i < num_branches_pre:
                 if num_channels_cur_layer[i] != num_channels_pre_layer[i]:
-                    transition_layers.append(nn.Sequential(
-                        nn.Conv2d(num_channels_pre_layer[i],
+                    transition_layers.append(MaskedSequential(
+                        MaskedConv2d(num_channels_pre_layer[i],
                                   num_channels_cur_layer[i],
                                   3,
                                   1,
@@ -407,20 +438,20 @@ class CAT_Net(nn.Module):
                     inchannels = num_channels_pre_layer[-1]
                     outchannels = num_channels_cur_layer[i] \
                         if j == i - num_branches_pre else inchannels
-                    conv3x3s.append(nn.Sequential(
-                        nn.Conv2d(
+                    conv3x3s.append(MaskedSequential(
+                        MaskedConv2d(
                             inchannels, outchannels, 3, 2, 1, bias=False),
                         BatchNorm2d(outchannels, momentum=BN_MOMENTUM),
                         nn.ReLU(inplace=True)))
-                transition_layers.append(nn.Sequential(*conv3x3s))
+                transition_layers.append(MaskedSequential(*conv3x3s))
 
         return nn.ModuleList(transition_layers)
 
     def _make_layer(self, block, inplanes, planes, blocks, stride=1):
         downsample = None
         if stride != 1 or inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(inplanes, planes * block.expansion,
+            downsample = MaskedSequential(
+                MaskedConv2d(inplanes, planes * block.expansion,
                           kernel_size=1, stride=stride, bias=False),
                 BatchNorm2d(planes * block.expansion, momentum=BN_MOMENTUM),
             )
@@ -431,7 +462,7 @@ class CAT_Net(nn.Module):
         for i in range(1, blocks):
             layers.append(block(inplanes, planes))
 
-        return nn.Sequential(*layers)
+        return MaskedSequential(*layers)
 
     def _make_stage(self, layer_config, num_inchannels,
                     multi_scale_output=True):
@@ -450,7 +481,7 @@ class CAT_Net(nn.Module):
             else:
                 reset_multi_scale_output = True
             modules.append(
-                HighResolutionModule(num_branches,
+                MaskedHighResolutionModule(num_branches,
                                      block,
                                      num_blocks,
                                      num_inchannels,
@@ -460,83 +491,127 @@ class CAT_Net(nn.Module):
             )
             num_inchannels = modules[-1].get_num_inchannels()
 
-        return nn.Sequential(*modules), num_inchannels
+        return MaskedSequential(*modules), num_inchannels
 
-    def forward(self, x, qtable):
+    def forward(self, x, qtable, distraction_cover=None):
+        # get mask from distraction cover
+        mask = create_mask(distraction_cover, x=x)
+        DCT_mask = copy_mask(mask)
+
         RGB, DCTcoef = x[:, :3, :, :], x[:, 3:, :, :]
 
+        # check if mask is same size as input
+        if mask.size(2) != RGB.size(2) or mask.size(3) != RGB.size(3):
+            raise ValueError("Mask size {} does not match input size {}".format(mask.size(), RGB.size()))
+        if DCT_mask.size(2) != DCTcoef.size(2) or DCT_mask.size(3) != DCTcoef.size(3):
+            raise ValueError("DCT Mask size {} does not match DCT input size {}".format(DCT_mask.size(), DCTcoef.size()))
+
+
         # RGB Stream
-        x = self.conv1(RGB)
+        x, mask = self.conv1(RGB, mask)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.conv2(x)
+        x, mask = self.conv2(x, mask)
         x = self.bn2(x)
         x = self.relu(x)
-        x = self.layer1(x)
+        x, mask = self.layer1(x, mask)
 
         x_list = []
+        mask_list = []
         for i in range(self.stage2_cfg['NUM_BRANCHES']):
             if self.transition1[i] is not None:
-                x_list.append(self.transition1[i](x))
+                # x_list.append(self.transition1[i](x))
+                _mask = copy_mask(mask)
+                _x, _mask = self.transition1[i](x, _mask)
+                x_list.append(_x)
+                mask_list.append(_mask)
             else:
                 x_list.append(x)
-        y_list = self.stage2(x_list)
+                mask_list.append(mask)
+        y_list, y_mask_list  = self.stage2(x_list, mask_list)
 
         x_list = []
+        mask_list = []
         for i in range(self.stage3_cfg['NUM_BRANCHES']):
             if self.transition2[i] is not None:
-                x_list.append(self.transition2[i](y_list[-1]))
+                _mask = copy_mask(y_mask_list[-1])
+                _x, _mask = self.transition2[i](y_list[-1], _mask)
+                x_list.append(_x)
+                mask_list.append(_mask)
             else:
                 x_list.append(y_list[i])
-        y_list = self.stage3(x_list)
+                mask_list.append(y_mask_list[i])
+        y_list, y_mask_list = self.stage3(x_list, mask_list)
 
         x_list = []
+        mask_list = []
         for i in range(self.stage4_cfg['NUM_BRANCHES']):
             if self.transition3[i] is not None:
-                x_list.append(self.transition3[i](y_list[-1]))
+                _mask = copy_mask(y_mask_list[-1])
+                _x, _mask = self.transition3[i](y_list[-1], _mask)
+                x_list.append(_x)
+                mask_list.append(_mask)
             else:
                 x_list.append(y_list[i])
-        RGB_list = self.stage4(x_list)
+                mask_list.append(y_mask_list[i])
+        RGB_list, RGB_mask_list = self.stage4(x_list, mask_list)
 
         # DCT Stream
-        x = self.dc_layer0_dil(DCTcoef)
-        x = self.dc_layer1_tail(x)
+        x, DCT_mask = self.dc_layer0_dil(DCTcoef, DCT_mask)
+        x, DCT_mask = self.dc_layer1_tail(x, DCT_mask)
         B, C, H, W = x.shape
         x0 = x.reshape(B, C, H // 8, 8, W // 8, 8).permute(0, 1, 3, 5, 2, 4).reshape(B, 64 * C, H // 8,
-                                                                                     W // 8)  # [B, 256, 32, 32]
-        x_temp = x.reshape(B, C, H // 8, 8, W // 8, 8).permute(0, 1, 3, 5, 2, 4)  # [B, C, 8, 8, 32, 32]
+                                                                                     W // 8)  # [B, 256, 32, 32] [B, C*64, H/8, W/8]
+        x_temp = x.reshape(B, C, H // 8, 8, W // 8, 8).permute(0, 1, 3, 5, 2, 4)  # [B, C, 8, 8, 32, 32] [B, C, 8, 8, H/8, W/8]
         q_temp = qtable.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 8, 8, 1, 1]
-        xq_temp = x_temp * q_temp  # [B, C, 8, 8, 32, 32]
-        x1 = xq_temp.reshape(B, 64 * C, H // 8, W // 8)  # [B, 256, 32, 32]
-        x = torch.cat([x0, x1], dim=1)
-        x = self.dc_layer2(x)  # x.shape = torch.Size([1, 96, 64, 64])
+        xq_temp = x_temp * q_temp  # [B, C, 8, 8, 32, 32] [B, C, 8, 8, H/8, W/8]
+        x1 = xq_temp.reshape(B, 64 * C, H // 8, W // 8)  # [B, 256, 32, 32] [B, C*64, H/8, W/8]
+        x = torch.cat([x0, x1], dim=1) # [B, 512, 32, 32] [B, C*128, H/8, W/8]
+
+        DCT_mask_1_8 = F.avg_pool2d(DCT_mask.float(), kernel_size=8, stride=8) # TODO: double check this
+        DCT_mask_1_8 = (DCT_mask_1_8 > 0).float()
+        x, DCT_mask_1_8 = self.dc_layer2(x, DCT_mask_1_8)  # x.shape = torch.Size([1, 96, 64, 64])
 
         x_list = []
+        mask_list = []
         for i in range(self.dc_stage3_cfg['NUM_BRANCHES']):
             if self.dc_transition2[i] is not None:
-                x_list.append(self.dc_transition2[i](x))
+                _x, _mask = self.dc_transition2[i](x, DCT_mask_1_8)
+                x_list.append(_x)
+                mask_list.append(_mask)
             else:
                 x_list.append(x)
-        y_list = self.dc_stage3(x_list)
+                mask_list.append(DCT_mask_1_8)
+        y_list, y_mask_list = self.dc_stage3(x_list, mask_list)
 
         x_list = []
+        mask_list = []
         for i in range(self.dc_stage4_cfg['NUM_BRANCHES']):
             if self.dc_transition3[i] is not None:
-                x_list.append(self.dc_transition3[i](y_list[-1]))
+                _x, _mask = self.dc_transition3[i](y_list[-1], y_mask_list[-1])
+                x_list.append(_x)
+                mask_list.append(_mask)
             else:
                 x_list.append(y_list[i])
-        DC_list = self.dc_stage4(x_list)
+                mask_list.append(y_mask_list[i])
+        DC_list, DC_mask_list = self.dc_stage4(x_list, mask_list)
 
         # stage 5
         x = [torch.cat([RGB_list[i+1], DC_list[i]], 1) for i in range(self.stage5_cfg['NUM_BRANCHES']-1)]
         x.insert(0, RGB_list[0])
+
         x_list = []
+        mask_list = []
         for i in range(self.stage5_cfg['NUM_BRANCHES']):
             if self.transition4[i] is not None:
-                x_list.append(self.transition4[i](x[i]))
+                _x, _mask = self.transition4[i](x[i], RGB_mask_list[i])
+                # _x, _mask = self.transition4[i](x[i], DCT_mask[i])
+                x_list.append(_x)
+                mask_list.append(_mask)
             else:
                 x_list.append(x[i])
-        x = self.stage5(x_list)
+                mask_list.append(RGB_mask_list[i])
+        x, mask_list = self.stage5(x_list, mask_list)
 
         # Upsampling
         x0_h, x0_w = x[0].size(2), x[0].size(3)
@@ -546,7 +621,7 @@ class CAT_Net(nn.Module):
 
         x = torch.cat([x[0], x1, x2, x3], 1)
 
-        x = self.last_layer(x)
+        x, mask_list = self.last_layer(x, mask_list[0])
 
         return x
 
