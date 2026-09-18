@@ -2,5 +2,10 @@
 weights/*
 !weights/placeholder
 
+evaluation/datasets/*
+!evaluation/datasets/placeholder
+
 env/*
 !env/placeholder
+
+*.pyc

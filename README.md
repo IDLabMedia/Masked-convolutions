@@ -35,6 +35,7 @@ CAT-Net/        # CAT-Net adapted to use masked convolutions
 TruFor/         # TruFor adapted to use masked convolutions
 images/         # Example input images
 covers/         # Example distraction masks (PNG, same size as input, white = masked)
+evaluation/     # Paper evaluation splits, distraction PNGs, dataloader, and evaluation script
 create_env.sh   # Conda environment setup script
 ```
 
@@ -95,6 +96,52 @@ Example with automatic iterative masking:
 ```bash
 python ./test.py -w ../weights/trufor.pth.tar -idc -in ../images -out ../output
 ```
+
+## Paper Evaluation
+
+The `evaluation/` folder reproduces the evaluation protocol used in the paper:
+
+```
+evaluation/
+  datasets/       # Base images and ground-truth masks (download separately)
+  distractions/   # Ten transparent distraction PNGs used in the paper
+  splits/         # CSV splits used in the paper
+  dataset.py      # On-the-fly distraction compositing dataloader
+  model_test.py   # TruFor and CAT-Net evaluation script
+  output/         # Per-image evaluation results
+```
+
+The 12 semicolon-separated CSV splits cover **DSO-1**, **IMD2020**, **OpenForensics**, and **VIPP**, each with an `original` condition without distractions, a `small` condition with distractions sized 4-12% of the image's long side, and a `large` condition with distractions sized 12-24%. They specify the image and mask paths, distraction PNG, distraction size and position, post-processing JPEG quality, output width, and mask inversion where needed. Images are resized and center-cropped to a 1536-pixel long side and JPEG-compressed with a randomly assigned quality factor between 85 and 95.
+
+Download the original datasets from their respective sources. Either place them in `evaluation/datasets/`, or pass the folder containing them with `-d`.
+
+Run evaluation from within `evaluation/`:
+
+```bash
+python ./model_test.py -m [model] -csv [split CSV] -d [dataset folder] -w [path to weights]
+```
+
+Options:
+- `-m` — model: `TruFor`, `TruFor_masked`, `CAT-Net`, or `CAT-Net_masked`
+- `-mask` — masking mode (only used for masked models): `none`, `auto` (the composited distraction cover), or `iterative` (two inference rounds, threshold 0.5, 5% long-side dilation)
+- `-csv` — evaluation split CSV
+- `-d` — folders containing the dataset images/masks (default: `./datasets`)
+- `-dis` — folder containing the distraction PNGs (default: `./distractions`)
+- `-w` — model checkpoint
+- `-out` — per-image IoU, MCC, and F1 results CSV (default: `./output/results.csv`)
+- `-gpu` — GPU index; use `-1` for CPU
+
+
+
+Example with iterative automatic masking:
+```bash
+python ./model_test.py -m TruFor_masked -mask iterative \
+  -csv "splits/IMD2020_random_distractions_QF_(85-95)_small_(4.0-12.0).csv" \
+  -d ./datasets -dis ./distractions -w ../weights/trufor.pth.tar \
+  -out ./output/results_IMD2020_small_iterative.csv
+```
+
+_Note:_ Results may differ slightly from those reported in the paper due to differences in software versions, hardware, and numerical nondeterminism.
 
 ## Citation
 
